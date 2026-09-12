@@ -9,13 +9,20 @@ Set these values before deployment:
 
 ```sh
 TUNNEL_BASE_DOMAIN=tunnel.example.com
-TUNNEL_SERVER_ADDR=control.tunnel.example.com
+TUNNEL_SERVER_ADDR=100.64.0.10
+TUNNEL_CONTROL_BIND_ADDR=100.64.0.10
+TUNNEL_CONTROL_ALLOW_FROM=100.64.0.0/10
+TUNNEL_ALLOWED_DOMAINS=app,docs,staging
 TUNNEL_SERVER_USER=deploy
 TUNNEL_SERVER=server.example.com
 ```
 
-`TUNNEL_BASE_DOMAIN` is the suffix after the label. The control hostname is a
-specific DNS record and must not rely on an unexpected wildcard precedence.
+`TUNNEL_BASE_DOMAIN` is the suffix after the label. `TUNNEL_SERVER_ADDR` and
+`TUNNEL_CONTROL_BIND_ADDR` must be private/VPN addresses; for Tailscale, use
+the server's `100.64.0.0/10` address. `TUNNEL_CONTROL_ALLOW_FROM` is the
+authorized VPN/private CIDR. The control channel must not depend on a public
+DNS record. `TUNNEL_ALLOWED_DOMAINS` is the exact, lowercase, comma-separated
+label allowlist shared by the client and server.
 
 ## Preflight discovery
 
@@ -33,19 +40,20 @@ Never overwrite an existing site to make room for Portspan.
 
 ## DNS
 
-Create these records in the authoritative zone:
+Create this record in the authoritative zone:
 
 ```text
 *.tunnel.example.com       A  SERVER_PUBLIC_IP  DNS-only
-control.tunnel.example.com A  SERVER_PUBLIC_IP  DNS-only
 ```
 
-Verify both wildcard behavior and the exact control record:
+Verify wildcard behavior:
 
 ```sh
 dig +short app.tunnel.example.com
-dig +short control.tunnel.example.com
 ```
+
+Do not create a public DNS record for the frp control address. The client
+connects to the private/VPN address directly.
 
 Do not edit an unrelated hostname such as an existing DNS dashboard record.
 
@@ -56,8 +64,19 @@ working tree:
 
 ```sh
 sudo env TUNNEL_BASE_DOMAIN=tunnel.example.com \
+  TUNNEL_CONTROL_BIND_ADDR=100.64.0.10 \
+  TUNNEL_CONTROL_ALLOW_FROM=100.64.0.0/10 \
+  TUNNEL_ALLOWED_DOMAINS=app,docs,staging \
   ./scripts/install-server.sh
 ```
+
+Before installation, record the target with `uname -s` and `uname -m`. The
+installer resolves the CPU architecture, verifies the matching frp release
+archive, and uses the verified source-build fallback when the release does
+not publish a native archive for an otherwise Go-supported target. It binds
+frps to `TUNNEL_CONTROL_BIND_ADDR` and, when UFW is active, permits port 7000
+only from `TUNNEL_CONTROL_ALLOW_FROM`. It also renders the exact Nginx host
+allowlist at `/etc/tunnel/portspan-allowed-hosts.conf`.
 
 The installer pins frp, verifies the release checksum, creates a dedicated
 `frps` user, writes `/etc/frp/server-token` with mode `600`, enables TLS
@@ -82,12 +101,17 @@ cp config/client.env.example ~/.config/tunnel/config
 chmod 600 ~/.config/tunnel/config
 ```
 
-Edit the copied config with your control hostname and base domain. Start one
-proxy:
+Edit the copied config with your private/VPN control address, base domain, and
+the same exact allowed label list. Start one proxy:
 
 ```sh
 tunnel --port 3000 --domain app
 ```
+
+Each `--domain` label must be unique per Portspan server. The client prevents
+two local tunnel processes from claiming the same label, while frps rejects a
+label already registered by another client. Stop the existing tunnel or use
+a different label; labels are never silently replaced.
 
 If the application binds only to IPv6, the default `localhost` is intentional.
 For an explicit address:
@@ -105,12 +129,19 @@ tunnel --port 3000 --domain app --host-header app.local
 ## Nginx HTTP enablement
 
 Use a deployment-specific copy of `deploy/nginx-http.conf`, replace the
-example base domain, then install it as a new site:
+example base domain, render the exact allowlist, then install it as a new
+site:
+
+```sh
+sudo env TUNNEL_BASE_DOMAIN=tunnel.example.com \
+  TUNNEL_ALLOWED_DOMAINS=app,docs,staging \
+  ./scripts/render-nginx-allowlist.sh
+```
 
 ```sh
 sudo install -o root -g root -m 644 deploy/nginx-http.conf \
   /etc/nginx/sites-available/portspan
-sudo ln -s /etc/nginx/sites-available/portspan \
+sudo ln -sfn /etc/nginx/sites-available/portspan \
   /etc/nginx/sites-enabled/portspan
 sudo nginx -t
 sudo systemctl reload nginx
@@ -125,10 +156,11 @@ ssh user@server 'curl -H "Host: app.tunnel.example.com" http://127.0.0.1:18080/'
 
 ## HTTPS certificate and enablement
 
-Create a Cloudflare API token with only `Zone:Read` and `DNS:Edit` for the
-single authoritative zone. Store it at `/etc/lego/cloudflare_dns_api_token`
-with mode `600`. Store non-secret values from `deploy/tunnel.env.example` at
-`/etc/tunnel/tunnel.env`, also root-only.
+The default HTTPS mode uses a persistent self-signed private CA. It does not
+need a Cloudflare token or ACME account. Copy the non-secret values from
+`deploy/tunnel.env.example` to `/etc/tunnel/tunnel.env` with mode `600`, set
+the actual base domain and exact allowlist, and keep the CA key on the server.
+Only `/etc/tunnel/pki/portspan-ca.crt` is distributed to trusted clients.
 
 Install the certificate script and units:
 
@@ -143,16 +175,42 @@ sudo systemctl daemon-reload
 sudo systemctl start tunnel-cert.service
 ```
 
-Only after the certificate exists, install `deploy/nginx-https.conf` as the
-Portspan site, remove the HTTP-only site if appropriate, test, and reload.
-Then verify the certificate and request:
+The service creates `/etc/tunnel/pki/portspan-ca.key` with mode `600`, signs a
+single-label wildcard leaf for `*.TUNNEL_BASE_DOMAIN`, and renews it before
+expiry. It validates the certificate, key, hostname coverage, and Nginx
+configuration before reloading. Enable the timer after the first successful
+run:
+
+```sh
+sudo systemctl enable --now tunnel-cert.timer
+```
+
+Only after the certificate exists, replace the HTTP-only site with a
+deployment-specific copy of `deploy/nginx-https.conf`, substituting the base
+domain in its certificate paths. Do not enable both templates because both
+listen on port 80. Run `nginx -t` and reload after the replacement. Install the
+CA certificate in the client or browser trust store, or pass it explicitly for
+a controlled check. Then verify the certificate and request:
+
+```sh
+sudo install -m 644 deploy/nginx-https.conf \
+  /etc/nginx/sites-available/portspan
+sudo nginx -t
+sudo systemctl reload nginx
+```
 
 ```sh
 openssl s_client -connect app.tunnel.example.com:443 \
   -servername app.tunnel.example.com </dev/null 2>/dev/null \
   | openssl x509 -noout -subject -issuer -dates
-curl --fail --max-time 15 https://app.tunnel.example.com/
+curl --fail --cacert /path/to/portspan-ca.crt --max-time 15 \
+  https://app.tunnel.example.com/
 ```
+
+An untrusted browser or plain `curl` is expected to reject this certificate.
+That is a trust-store issue, not a DNS-only or Nginx proxy issue. Use an ACME
+certificate instead when public clients must trust HTTPS without installing a
+private CA; the DNS wildcard and exact Nginx allowlist remain separate.
 
 ## 504 troubleshooting
 
@@ -175,4 +233,3 @@ scope. To roll back Portspan, stop/disable `frps`, remove only the Portspan
 Nginx symlink, restore the prior Nginx configuration if it was changed, and
 reload after `nginx -t` succeeds. Leave unrelated services and DNS records
 untouched.
-

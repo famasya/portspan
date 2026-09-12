@@ -1,27 +1,35 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/frp-platform.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/frp-release.sh"
+
 FRP_VERSION=${FRP_VERSION:-0.71.0}
 USER_HOME=${HOME:?HOME is required}
 SYSTEM=$(uname -s)
 MACHINE=$(uname -m)
 
-case "$SYSTEM:$MACHINE" in
-  Darwin:arm64|Darwin:aarch64)
-    FRP_OS=darwin
-    FRP_ARCH=arm64
-    FRP_SHA256=45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6
-    ;;
-  Linux:x86_64|Linux:amd64)
-    FRP_OS=linux
-    FRP_ARCH=amd64
-    FRP_SHA256=84f27e39f11169f7adcef8e8b70c9329de17747b1f14dad9fb95eef5682ea716
-    ;;
-  *)
-    echo "unsupported platform: $SYSTEM $MACHINE; add a reviewed checksum before installing" >&2
+if ! frp_resolve_platform "$SYSTEM" "$MACHINE"; then
+  echo "unable to map platform $SYSTEM $MACHINE to a supported frp target" >&2
+  exit 1
+fi
+
+if [ "$FRP_RELEASE_ASSET" = yes ]; then
+  ARCHIVE="frp_${FRP_VERSION}_${FRP_OS}_${FRP_ARCH}.tar.gz"
+  FRP_SHA256=$(frp_expected_sha256 "$ARCHIVE") || {
+    echo "no reviewed checksum is available for $ARCHIVE" >&2
     exit 1
-    ;;
-esac
+  }
+else
+  ARCHIVE=
+  FRP_SHA256=$(frp_source_sha256 "$FRP_VERSION") || {
+    echo "no reviewed source checksum is available for frp $FRP_VERSION" >&2
+    exit 1
+  }
+fi
 
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
@@ -39,21 +47,68 @@ TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/portspan.XXXXXX")
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT INT TERM
 
-ARCHIVE="frp_${FRP_VERSION}_${FRP_OS}_${FRP_ARCH}.tar.gz"
-URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${ARCHIVE}"
-curl --fail --silent --show-error --location --retry 3 --proto '=https' --tlsv1.2 \
-  -o "$TMP_DIR/$ARCHIVE" "$URL"
+if [ -n "$ARCHIVE" ]; then
+  URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${ARCHIVE}"
+  curl --fail --silent --show-error --location --retry 3 --proto '=https' --tlsv1.2 \
+    -o "$TMP_DIR/$ARCHIVE" "$URL"
 
-ACTUAL_SHA256=$(sha256 "$TMP_DIR/$ARCHIVE")
-[ "$ACTUAL_SHA256" = "$FRP_SHA256" ] || {
-  echo "checksum mismatch for $ARCHIVE" >&2
+  ACTUAL_SHA256=$(sha256 "$TMP_DIR/$ARCHIVE")
+  [ "$ACTUAL_SHA256" = "$FRP_SHA256" ] || {
+    echo "checksum mismatch for $ARCHIVE" >&2
+    exit 1
+  }
+
+  tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+  FRPC_SOURCE="$TMP_DIR/frp_${FRP_VERSION}_${FRP_OS}_${FRP_ARCH}/frpc"
+else
+  command -v go >/dev/null 2>&1 || {
+    echo "Go is required to build frp for $SYSTEM $MACHINE" >&2
+    exit 1
+  }
+
+  SOURCE_ARCHIVE="frp-${FRP_VERSION}.tar.gz"
+  SOURCE_URL="https://github.com/fatedier/frp/archive/refs/tags/v${FRP_VERSION}.tar.gz"
+  curl --fail --silent --show-error --location --retry 3 --proto '=https' --tlsv1.2 \
+    -o "$TMP_DIR/$SOURCE_ARCHIVE" "$SOURCE_URL"
+
+  ACTUAL_SHA256=$(sha256 "$TMP_DIR/$SOURCE_ARCHIVE")
+  [ "$ACTUAL_SHA256" = "$FRP_SHA256" ] || {
+    echo "checksum mismatch for $SOURCE_ARCHIVE" >&2
+    exit 1
+  }
+
+  tar -xzf "$TMP_DIR/$SOURCE_ARCHIVE" -C "$TMP_DIR"
+  SOURCE_DIR="$TMP_DIR/frp-${FRP_VERSION}"
+  [ -d "$SOURCE_DIR" ] || {
+    echo "source archive did not contain frp-${FRP_VERSION}" >&2
+    exit 1
+  }
+
+  if [ -n "$FRP_GOARM" ]; then
+    (
+      cd "$SOURCE_DIR"
+      CGO_ENABLED=0 GOOS="$FRP_GOOS" GOARCH="$FRP_GOARCH" GOARM="$FRP_GOARM" \
+        go build -trimpath -ldflags '-s -w' -tags 'frpc,noweb' \
+        -o "$TMP_DIR/frpc" ./cmd/frpc
+    )
+  else
+    (
+      cd "$SOURCE_DIR"
+      CGO_ENABLED=0 GOOS="$FRP_GOOS" GOARCH="$FRP_GOARCH" \
+        go build -trimpath -ldflags '-s -w' -tags 'frpc,noweb' \
+        -o "$TMP_DIR/frpc" ./cmd/frpc
+    )
+  fi
+  FRPC_SOURCE="$TMP_DIR/frpc"
+fi
+
+[ -x "$FRPC_SOURCE" ] || {
+  echo "frpc was not produced for $SYSTEM $MACHINE" >&2
   exit 1
 }
 
-tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
-FRP_DIR="$TMP_DIR/frp_${FRP_VERSION}_${FRP_OS}_${FRP_ARCH}"
 install -d -m 755 "$USER_HOME/.local/lib/tunnel"
-install -m 755 "$FRP_DIR/frpc" "$USER_HOME/.local/lib/tunnel/frpc"
+install -m 755 "$FRPC_SOURCE" "$USER_HOME/.local/lib/tunnel/frpc"
 
 install -d -m 700 "$USER_HOME/.config/tunnel"
 if [ ! -e "$USER_HOME/.config/tunnel/config" ]; then
@@ -63,4 +118,3 @@ fi
 
 echo "Installed frpc $FRP_VERSION at $USER_HOME/.local/lib/tunnel/frpc"
 echo "Create ~/.config/tunnel/config and ~/.config/tunnel/token before running tunnel."
-

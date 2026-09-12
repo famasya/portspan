@@ -16,16 +16,132 @@ TOKEN_FILE=${TUNNEL_TOKEN_FILE:-"$USER_HOME/.config/tunnel/token"}
 SERVER_ADDR=${TUNNEL_SERVER_ADDR:-}
 SERVER_PORT=${TUNNEL_SERVER_PORT:-7000}
 BASE_DOMAIN=${TUNNEL_BASE_DOMAIN:-}
+ALLOWED_DOMAINS=${TUNNEL_ALLOWED_DOMAINS:-}
 
 usage() {
   echo "Usage: tunnel --port PORT --domain LABEL [--host HOST] [--host-header HOST]" >&2
   echo "Example: tunnel --port 3000 --domain app" >&2
+  echo "Each domain label must be unique for the configured server." >&2
 }
 
 fail() {
   echo "tunnel: $*" >&2
   usage
   exit 2
+}
+
+is_private_ipv4() {
+  private_address=$1
+  case "$private_address" in
+    ''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+
+  private_old_ifs=$IFS
+  IFS=.
+  set -- $private_address
+  IFS=$private_old_ifs
+  [ "$#" -eq 4 ] || return 1
+
+  for private_octet in "$@"; do
+    [ "$private_octet" -le 255 ] 2>/dev/null || return 1
+  done
+
+  case "$1" in
+    10|100|192)
+      if [ "$1" -eq 100 ]; then
+        [ "$2" -ge 64 ] 2>/dev/null && [ "$2" -le 127 ] 2>/dev/null || return 1
+      elif [ "$1" -eq 192 ]; then
+        [ "$2" -eq 168 ] 2>/dev/null || return 1
+      fi
+      ;;
+    172)
+      [ "$2" -ge 16 ] 2>/dev/null && [ "$2" -le 31 ] 2>/dev/null || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_private_or_vpn_address() {
+  private_address=$1
+  case "$private_address" in
+    *:*)
+      case "$private_address" in
+        [Ff][Cc]:*|[Ff][Cc][0-9A-Fa-f]:*|[Ff][Cc][0-9A-Fa-f][0-9A-Fa-f]:*|\
+        [Ff][Dd]:*|[Ff][Dd][0-9A-Fa-f]:*|[Ff][Dd][0-9A-Fa-f][0-9A-Fa-f]:*|\
+        [Ff][Ee]80:*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      is_private_ipv4 "$private_address"
+      ;;
+  esac
+}
+
+validate_dns_label() {
+  policy_label=$1
+  case "$policy_label" in
+    ''|*[!a-z0-9-]*|-*|*-|control) return 1 ;;
+  esac
+  [ "${#policy_label}" -le 63 ]
+}
+
+validate_base_domain() {
+  policy_domain=$1
+  case "$policy_domain" in
+    ''|*[!A-Za-z0-9.-]*|.*|*.) return 1 ;;
+  esac
+
+  [ "${#policy_domain}" -le 253 ] || return 1
+  policy_old_ifs=$IFS
+  IFS=.
+  set -- $policy_domain
+  IFS=$policy_old_ifs
+  [ "$#" -ge 2 ] || return 1
+
+  for policy_label in "$@"; do
+    case "$policy_label" in
+      ''|-*|*-|*[!A-Za-z0-9-]*) return 1 ;;
+    esac
+    [ "${#policy_label}" -le 63 ] || return 1
+  done
+}
+
+validate_allowed_domains() {
+  policy_allowed=$1
+  case "$policy_allowed" in
+    ''|*[!a-z0-9,-]*|,*|*,,|*,) return 1 ;;
+  esac
+
+  policy_old_ifs=$IFS
+  IFS=,
+  set -- $policy_allowed
+  IFS=$policy_old_ifs
+  [ "$#" -gt 0 ] || return 1
+
+  policy_seen=
+  for policy_label in "$@"; do
+    validate_dns_label "$policy_label" || return 1
+    case ",$policy_seen," in
+      *,"$policy_label",*) return 1 ;;
+    esac
+    if [ -n "$policy_seen" ]; then
+      policy_seen="$policy_seen,$policy_label"
+    else
+      policy_seen=$policy_label
+    fi
+  done
+}
+
+allowed_domain_contains() {
+  policy_allowed=$1
+  policy_candidate=$2
+  case ",$policy_allowed," in
+    *,"$policy_candidate",*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 port=
@@ -67,6 +183,10 @@ done
 
 [ -n "$SERVER_ADDR" ] || fail "TUNNEL_SERVER_ADDR is not configured in $CONFIG_FILE or the environment"
 [ -n "$BASE_DOMAIN" ] || fail "TUNNEL_BASE_DOMAIN is not configured in $CONFIG_FILE or the environment"
+[ -n "$ALLOWED_DOMAINS" ] || fail "TUNNEL_ALLOWED_DOMAINS is not configured in $CONFIG_FILE or the environment"
+[ "$SERVER_ADDR" != "localhost" ] || fail "TUNNEL_SERVER_ADDR must be a private or VPN IP, not localhost"
+is_private_or_vpn_address "$SERVER_ADDR" || fail "TUNNEL_SERVER_ADDR must be a private or VPN IP address (for example a Tailscale 100.64.0.0/10 address)"
+[ "$SERVER_ADDR" != "127.0.0.1" ] || fail "TUNNEL_SERVER_ADDR must be a private or VPN IP, not loopback"
 [ -n "$port" ] || fail "--port is required"
 [ -n "$domain" ] || fail "--domain is required"
 
@@ -80,9 +200,10 @@ case "$SERVER_PORT" in
 esac
 [ "$SERVER_PORT" -ge 1 ] 2>/dev/null && [ "$SERVER_PORT" -le 65535 ] 2>/dev/null || fail "TUNNEL_SERVER_PORT must be between 1 and 65535"
 
-case "$domain" in
-  ''|*[!a-z0-9-]*|-*|*-|control) fail "domain must be one lowercase DNS label and not reserved" ;;
-esac
+validate_base_domain "$BASE_DOMAIN" || fail "TUNNEL_BASE_DOMAIN must be a valid nested DNS name"
+validate_allowed_domains "$ALLOWED_DOMAINS" || fail "TUNNEL_ALLOWED_DOMAINS must be unique lowercase labels separated by commas"
+validate_dns_label "$domain" || fail "domain must be one lowercase DNS label and not reserved"
+allowed_domain_contains "$ALLOWED_DOMAINS" "$domain" || fail "domain '$domain' is not in TUNNEL_ALLOWED_DOMAINS"
 
 case "$local_host" in
   ''|*[!A-Za-z0-9._:-]*) fail "host must contain only letters, numbers, dots, colons, or hyphens" ;;
@@ -95,12 +216,58 @@ esac
 [ -x "$FRPC_BIN" ] || fail "frpc not found at $FRPC_BIN"
 [ -r "$TOKEN_FILE" ] || fail "token file not readable at $TOKEN_FILE"
 
+LOCK_ROOT=${TUNNEL_LOCK_DIR:-"$USER_HOME/.config/tunnel/locks"}
+LOCK_KEY=$(printf '%s' "$SERVER_ADDR:$SERVER_PORT:$BASE_DOMAIN:$domain" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+LOCK_PATH="$LOCK_ROOT/$LOCK_KEY"
+LOCK_ACQUIRED=no
+
+acquire_domain_lock() {
+  mkdir -p "$LOCK_ROOT"
+  chmod 700 "$LOCK_ROOT"
+
+  if mkdir "$LOCK_PATH" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_PATH/pid"
+    LOCK_ACQUIRED=yes
+    return
+  fi
+
+  if [ -r "$LOCK_PATH/pid" ]; then
+    LOCK_PID=$(sed -n '1p' "$LOCK_PATH/pid")
+    case "$LOCK_PID" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$LOCK_PID" 2>/dev/null; then
+          fail "domain '$domain' is already in use by local tunnel process $LOCK_PID"
+        fi
+        rm -f "$LOCK_PATH/pid"
+        rmdir "$LOCK_PATH" 2>/dev/null || fail "domain '$domain' has a stale lock at $LOCK_PATH"
+        ;;
+    esac
+  fi
+
+  mkdir "$LOCK_PATH" 2>/dev/null || fail "domain '$domain' is already in use; stop the existing tunnel or remove the stale lock at $LOCK_PATH"
+  printf '%s\n' "$$" > "$LOCK_PATH/pid"
+  LOCK_ACQUIRED=yes
+}
+
+release_domain_lock() {
+  if [ "$LOCK_ACQUIRED" = yes ]; then
+    rm -f "$LOCK_PATH/pid"
+    rmdir "$LOCK_PATH" 2>/dev/null || true
+    LOCK_ACQUIRED=no
+  fi
+}
+
 umask 077
 CONFIG_TMP=$(mktemp "${TMPDIR:-/tmp}/tunnel-frpc.XXXXXX")
 cleanup() {
   rm -f "$CONFIG_TMP"
+  release_domain_lock
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
+
+acquire_domain_lock
+
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

@@ -1,10 +1,13 @@
-bindAddr = "0.0.0.0"
+# Bind the frp control channel only to the server's private/VPN address.
+bindAddr = "100.64.0.10"
 bindPort = 7000
 
 # Keep proxy traffic private; Nginx is the only public HTTP entrypoint.
 proxyBindAddr = "127.0.0.1"
 vhostHTTPPort = 18080
 subDomainHost = "tunnel.example.com"
+# frps handles transport/authentication; the exact public label allowlist is
+# enforced by the client wrapper and the generated Nginx server_name snippet.
 
 auth.method = "token"
 auth.tokenSource.type = "file"
@@ -22,4 +25,3 @@ log.to = "console"
 log.level = "info"
 log.maxDays = 7
 log.disablePrintColor = true
-

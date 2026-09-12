@@ -1,9 +1,8 @@
 [Unit]
-Description=Renew Portspan wildcard TLS certificate
+Description=Maintain Portspan private wildcard TLS certificate
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/tunnel-cert-renew
-

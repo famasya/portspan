@@ -7,9 +7,13 @@ new environment.
 
 - Confirm the target hostname, DNS provider, server login, public IP, Linux
   distribution, and intended base domain.
-- Research official frp release/configuration, Cloudflare wildcard DNS, and
-  lego DNS-01 documentation if the pinned assumptions are older than the
-  deployment date.
+- Record `uname -s` and `uname -m`; never assume the target is AMD64. Confirm
+  that the installer selects the matching frp artifact or uses its verified
+  source-build fallback for the detected CPU architecture.
+- Research official frp release/configuration and wildcard DNS behavior if the
+  pinned assumptions are older than the deployment date. The default HTTPS
+  path uses a self-signed private CA; use ACME documentation only when the
+  deployment explicitly chooses a publicly trusted certificate.
 - Inspect existing Nginx sites, listeners, firewall rules, cloudflared units,
   certificates, and renewal jobs.
 - Identify any existing hostname or service that must remain unchanged.
@@ -17,10 +21,15 @@ new environment.
 ## Build the plan
 
 - Pick a free internal vhost port, normally `18080`.
-- Reserve one control hostname and one wildcard DNS record.
+- Reserve one wildcard DNS record for the explicitly allowed application
+  labels. The frp control address is private/VPN only and gets no public DNS
+  record.
+- Choose the exact `TUNNEL_ALLOWED_DOMAINS` list and apply the same list to the
+  client configuration, server installer, and rendered Nginx host allowlist.
 - Decide whether HTTP is temporary or whether the deployment requires HTTPS
   before accepting traffic.
-- Decide how the scoped Cloudflare token will be created and rotated.
+- Decide whether private clients will trust the generated CA certificate or
+  whether the deployment needs a publicly trusted ACME certificate.
 - Write down rollback targets before installing files.
 
 ## Implement in layers
@@ -31,7 +40,8 @@ new environment.
 4. Install the client wrapper and distribute the token through a secure path.
 5. Start a test local HTTP service and verify direct frp vhost routing.
 6. Add the Nginx HTTP vhost and verify the public HTTP request.
-7. Provision the wildcard certificate with the scoped token.
+7. Generate the persistent private CA and wildcard leaf, then distribute only
+   the CA certificate to trusted clients.
 8. Add the HTTPS vhost and verify SNI, certificate dates, and a real request.
 9. Remove temporary files and record evidence.
 
@@ -50,4 +60,3 @@ Report these claims separately:
   are verified.
 
 Do not upgrade a partial claim into a complete deployment claim.
-

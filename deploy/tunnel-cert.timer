@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Portspan certificate renewal twice daily
+Description=Check Portspan private certificate twice daily
 
 [Timer]
 OnCalendar=*-*-* 00,12:00:00
@@ -7,4 +7,3 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-

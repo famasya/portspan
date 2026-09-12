@@ -2,44 +2,195 @@
 set -eu
 
 ENV_FILE=${TUNNEL_ENV_FILE:-/etc/tunnel/tunnel.env}
-TOKEN_FILE=${CLOUDFLARE_TOKEN_FILE:-/etc/lego/cloudflare_dns_api_token}
-LEGO_PATH=${LEGO_PATH:-/var/lib/lego-portspan}
+PKI_DIR=${TUNNEL_PKI_DIR:-/etc/tunnel/pki}
+SSL_DIR=${TUNNEL_SSL_DIR:-/etc/nginx/ssl}
+OPENSSL_BIN=${OPENSSL_BIN:-openssl}
+NGINX_BIN=${NGINX_BIN:-nginx}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}
 
 [ -r "$ENV_FILE" ] || { echo "Missing $ENV_FILE" >&2; exit 1; }
-[ -r "$TOKEN_FILE" ] || { echo "Missing $TOKEN_FILE" >&2; exit 1; }
 
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 : "${TUNNEL_BASE_DOMAIN:?TUNNEL_BASE_DOMAIN is required}"
-: "${TUNNEL_ACME_EMAIL:?TUNNEL_ACME_EMAIL is required}"
 
-export CLOUDFLARE_DNS_API_TOKEN=$(sed -n '1p' "$TOKEN_FILE")
-CERT_SOURCE="$LEGO_PATH/certificates/_.${TUNNEL_BASE_DOMAIN}.crt"
-KEY_SOURCE="$LEGO_PATH/certificates/_.${TUNNEL_BASE_DOMAIN}.key"
-CERT_TARGET="/etc/nginx/ssl/${TUNNEL_BASE_DOMAIN}.crt"
-KEY_TARGET="/etc/nginx/ssl/${TUNNEL_BASE_DOMAIN}.key"
+case "$TUNNEL_BASE_DOMAIN" in
+  ''|*[!A-Za-z0-9.-]*|.*|*.)
+    echo "TUNNEL_BASE_DOMAIN must be a valid nested DNS name" >&2
+    exit 1
+    ;;
+esac
+[ "${#TUNNEL_BASE_DOMAIN}" -le 253 ] || {
+  echo "TUNNEL_BASE_DOMAIN is too long" >&2
+  exit 1
+}
 
-install -d -o root -g root -m 755 /etc/nginx/ssl
+BASE_DOMAIN=$(printf '%s' "$TUNNEL_BASE_DOMAIN" | tr '[:upper:]' '[:lower:]')
+BASE_DOMAIN_IFS=$IFS
+IFS=.
+set -- $BASE_DOMAIN
+IFS=$BASE_DOMAIN_IFS
+[ "$#" -ge 2 ] || {
+  echo "TUNNEL_BASE_DOMAIN must contain at least two DNS labels" >&2
+  exit 1
+}
+for BASE_DOMAIN_LABEL in "$@"; do
+  case "$BASE_DOMAIN_LABEL" in
+    ''|-*|*-|*[!a-z0-9-]*)
+      echo "TUNNEL_BASE_DOMAIN contains an invalid DNS label" >&2
+      exit 1
+      ;;
+  esac
+  [ "${#BASE_DOMAIN_LABEL}" -le 63 ] || {
+    echo "TUNNEL_BASE_DOMAIN contains an oversized DNS label" >&2
+    exit 1
+  }
+done
 
-if [ -f "$CERT_SOURCE" ]; then
-  /usr/bin/lego --dns cloudflare --accept-tos \
-    --dns.resolvers 1.1.1.1:53 \
-    --domains "*.${TUNNEL_BASE_DOMAIN}" \
-    --email "$TUNNEL_ACME_EMAIL" \
-    --path "$LEGO_PATH" renew --days 30
-else
-  /usr/bin/lego --dns cloudflare --accept-tos \
-    --dns.resolvers 1.1.1.1:53 \
-    --domains "*.${TUNNEL_BASE_DOMAIN}" \
-    --email "$TUNNEL_ACME_EMAIL" \
-    --path "$LEGO_PATH" run
+CERT_DAYS=${TUNNEL_CERT_DAYS:-30}
+RENEW_DAYS=${TUNNEL_CERT_RENEW_DAYS:-15}
+case "$CERT_DAYS:$RENEW_DAYS" in
+  *[!0-9:]*|:*)
+    echo "TUNNEL_CERT_DAYS and TUNNEL_CERT_RENEW_DAYS must be positive integers" >&2
+    exit 1
+    ;;
+esac
+[ "$CERT_DAYS" -gt 0 ] && [ "$RENEW_DAYS" -gt 0 ] && [ "$RENEW_DAYS" -lt "$CERT_DAYS" ] || {
+  echo "TUNNEL_CERT_RENEW_DAYS must be less than TUNNEL_CERT_DAYS" >&2
+  exit 1
+}
+
+command -v "$OPENSSL_BIN" >/dev/null 2>&1 || {
+  echo "openssl is required" >&2
+  exit 1
+}
+command -v "$NGINX_BIN" >/dev/null 2>&1 || {
+  echo "nginx is required" >&2
+  exit 1
+}
+command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || {
+  echo "systemctl is required" >&2
+  exit 1
+}
+
+CA_KEY="$PKI_DIR/portspan-ca.key"
+CA_CERT="$PKI_DIR/portspan-ca.crt"
+CERT_HOST="app.$BASE_DOMAIN"
+CERT_TARGET="$SSL_DIR/$BASE_DOMAIN.crt"
+KEY_TARGET="$SSL_DIR/$BASE_DOMAIN.key"
+
+install -d -m 700 "$PKI_DIR"
+install -d -m 755 "$SSL_DIR"
+WORK_DIR=$(mktemp -d "$PKI_DIR/.renew.XXXXXX")
+CERT_STAGE="$SSL_DIR/.$BASE_DOMAIN.crt.$$"
+KEY_STAGE="$SSL_DIR/.$BASE_DOMAIN.key.$$"
+cleanup() {
+  rm -rf "$WORK_DIR" "$CERT_STAGE" "$KEY_STAGE"
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -e "$CA_KEY" ] && [ ! -e "$CA_CERT" ]; then
+  "$OPENSSL_BIN" req -x509 -newkey rsa:4096 -nodes -sha256 -days 3650 \
+    -keyout "$WORK_DIR/ca.key" \
+    -out "$WORK_DIR/ca.crt" \
+    -subj "/CN=Portspan Private CA" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -addext "subjectKeyIdentifier=hash" \
+    >/dev/null 2>&1
+  install -m 600 "$WORK_DIR/ca.key" "$CA_KEY"
+  install -m 644 "$WORK_DIR/ca.crt" "$CA_CERT"
+elif [ ! -f "$CA_KEY" ] || [ ! -f "$CA_CERT" ]; then
+  echo "Portspan CA key and certificate must be created or removed together" >&2
+  exit 1
 fi
 
-install -o root -g root -m 600 "$CERT_SOURCE" "$CERT_TARGET.tmp"
-install -o root -g root -m 600 "$KEY_SOURCE" "$KEY_TARGET.tmp"
+"$OPENSSL_BIN" x509 -in "$CA_CERT" -noout -checkend 0 >/dev/null
+"$OPENSSL_BIN" x509 -in "$CA_CERT" -noout -text | grep -F 'CA:TRUE' >/dev/null || {
+  echo "$CA_CERT is not a CA certificate" >&2
+  exit 1
+}
+chmod 600 "$CA_KEY"
+chmod 644 "$CA_CERT"
 
-/usr/sbin/nginx -t
-mv "$CERT_TARGET.tmp" "$CERT_TARGET"
-mv "$KEY_TARGET.tmp" "$KEY_TARGET"
-/usr/bin/systemctl reload nginx
+certificate_usable() {
+  [ -f "$CERT_TARGET" ] && [ -f "$KEY_TARGET" ] || return 1
+  chmod 644 "$CERT_TARGET"
+  chmod 600 "$KEY_TARGET"
+  "$OPENSSL_BIN" x509 -in "$CERT_TARGET" -noout -checkend "$((RENEW_DAYS * 86400))" >/dev/null 2>&1 || return 1
+  "$OPENSSL_BIN" x509 -in "$CERT_TARGET" -noout -checkhost "$CERT_HOST" >/dev/null 2>&1 || return 1
+  "$OPENSSL_BIN" verify -CAfile "$CA_CERT" "$CERT_TARGET" >/dev/null 2>&1 || return 1
+  "$OPENSSL_BIN" x509 -in "$CERT_TARGET" -pubkey -noout > "$WORK_DIR/current-cert.pub" || return 1
+  "$OPENSSL_BIN" pkey -in "$KEY_TARGET" -pubout > "$WORK_DIR/current-key.pub" || return 1
+  cmp -s "$WORK_DIR/current-cert.pub" "$WORK_DIR/current-key.pub"
+}
 
+if certificate_usable; then
+  "$NGINX_BIN" -t
+  echo "Portspan private wildcard certificate is still valid for *.$BASE_DOMAIN"
+  exit 0
+fi
+
+"$OPENSSL_BIN" genrsa -out "$WORK_DIR/leaf.key" 2048 >/dev/null 2>&1
+chmod 600 "$WORK_DIR/leaf.key"
+"$OPENSSL_BIN" req -new -sha256 -key "$WORK_DIR/leaf.key" \
+  -out "$WORK_DIR/leaf.csr" \
+  -subj "/CN=*.$BASE_DOMAIN" >/dev/null 2>&1
+cat > "$WORK_DIR/leaf.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:*.$BASE_DOMAIN
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+EOF
+SERIAL=$("$OPENSSL_BIN" rand -hex 16)
+"$OPENSSL_BIN" x509 -req -sha256 -days "$CERT_DAYS" \
+  -in "$WORK_DIR/leaf.csr" \
+  -CA "$CA_CERT" \
+  -CAkey "$CA_KEY" \
+  -set_serial "0x$SERIAL" \
+  -extfile "$WORK_DIR/leaf.ext" \
+  -out "$WORK_DIR/leaf.crt" >/dev/null 2>&1
+
+"$OPENSSL_BIN" x509 -in "$WORK_DIR/leaf.crt" -noout -checkend 0 >/dev/null
+"$OPENSSL_BIN" x509 -in "$WORK_DIR/leaf.crt" -noout -checkhost "$CERT_HOST" >/dev/null
+"$OPENSSL_BIN" verify -CAfile "$CA_CERT" "$WORK_DIR/leaf.crt" >/dev/null
+"$OPENSSL_BIN" x509 -in "$WORK_DIR/leaf.crt" -pubkey -noout > "$WORK_DIR/leaf-cert.pub"
+"$OPENSSL_BIN" pkey -in "$WORK_DIR/leaf.key" -pubout > "$WORK_DIR/leaf-key.pub"
+cmp -s "$WORK_DIR/leaf-cert.pub" "$WORK_DIR/leaf-key.pub" || {
+  echo "generated certificate and private key do not match" >&2
+  exit 1
+}
+
+HAD_CERT=0
+HAD_KEY=0
+[ -f "$CERT_TARGET" ] && { cp -p "$CERT_TARGET" "$WORK_DIR/old.crt"; HAD_CERT=1; }
+[ -f "$KEY_TARGET" ] && { cp -p "$KEY_TARGET" "$WORK_DIR/old.key"; HAD_KEY=1; }
+restore_previous() {
+  if [ "$HAD_CERT" -eq 1 ]; then
+    install -m 644 "$WORK_DIR/old.crt" "$CERT_TARGET"
+  else
+    rm -f "$CERT_TARGET"
+  fi
+  if [ "$HAD_KEY" -eq 1 ]; then
+    install -m 600 "$WORK_DIR/old.key" "$KEY_TARGET"
+  else
+    rm -f "$KEY_TARGET"
+  fi
+}
+
+install -m 644 "$WORK_DIR/leaf.crt" "$CERT_STAGE"
+install -m 600 "$WORK_DIR/leaf.key" "$KEY_STAGE"
+mv "$CERT_STAGE" "$CERT_TARGET"
+mv "$KEY_STAGE" "$KEY_TARGET"
+if ! "$NGINX_BIN" -t; then
+  restore_previous
+  exit 1
+fi
+if ! "$SYSTEMCTL_BIN" reload nginx; then
+  restore_previous
+  exit 1
+fi
+
+echo "Installed Portspan private wildcard certificate for *.$BASE_DOMAIN"

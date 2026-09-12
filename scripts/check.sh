@@ -9,6 +9,8 @@ for file in bin/tunnel scripts/*.sh deploy/tunnel-cert-renew; do
   sh -n "$file"
 done
 
+sh "$ROOT_DIR/scripts/test-platforms.sh"
+
 if find . -type f \( -name '*.key' -o -name '*.pem' -o -name '*.crt' -o -name '*.token' \) -not -path './.git/*' | grep -q .; then
   echo "secret-like certificate/key files are present in the repository" >&2
   exit 1
@@ -19,6 +21,10 @@ if rg -n --hidden --glob '!.git/**' --glob '!*.tar.gz' 'CLOUDFLARE_API_KEY(_FILE
   exit 1
 fi
 
+if rg -n 'server_name[[:space:]]+\*\.' deploy/nginx-http.conf deploy/nginx-https.conf; then
+  echo "Nginx must use the generated exact host allowlist, not a wildcard server_name" >&2
+  exit 1
+fi
+
 git diff --check
 echo "Portspan checks passed."
-

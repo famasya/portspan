@@ -24,6 +24,15 @@ client/server transport. Nginx terminates public TLS and forwards HTTP to the
 loopback-only frp vhost. This keeps the frp control port and the application
 traffic on separate boundaries.
 
+## For coding agents
+
+If you are a coding agent setting up Portspan on a real server, read
+[`AGENTS.md`](AGENTS.md) first, then follow the dedicated
+[coding-agent setup checklist](docs/coding-agent.md). It covers preflight
+discovery, official documentation checks, safe sequencing, evidence to report,
+secret handling, and rollback boundaries. Use the [operations guide](docs/operations.md)
+for the detailed command-level runbook.
+
 ## Repository layout
 
 - `bin/tunnel` — portable client wrapper with validation, IPv4/IPv6 localhost
@@ -131,4 +140,3 @@ and [custom subdomain documentation](https://gofrp.org/en/docs/features/http-htt
 This repository intentionally does not provision a domain, create DNS records,
 rotate account credentials, or copy secrets automatically. Those actions are
 environment-specific and are covered by the operator runbook.
-

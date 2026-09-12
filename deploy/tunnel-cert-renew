@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+
+ENV_FILE=${TUNNEL_ENV_FILE:-/etc/tunnel/tunnel.env}
+TOKEN_FILE=${CLOUDFLARE_TOKEN_FILE:-/etc/lego/cloudflare_dns_api_token}
+LEGO_PATH=${LEGO_PATH:-/var/lib/lego-portspan}
+
+[ -r "$ENV_FILE" ] || { echo "Missing $ENV_FILE" >&2; exit 1; }
+[ -r "$TOKEN_FILE" ] || { echo "Missing $TOKEN_FILE" >&2; exit 1; }
+
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+: "${TUNNEL_BASE_DOMAIN:?TUNNEL_BASE_DOMAIN is required}"
+: "${TUNNEL_ACME_EMAIL:?TUNNEL_ACME_EMAIL is required}"
+
+export CLOUDFLARE_DNS_API_TOKEN=$(sed -n '1p' "$TOKEN_FILE")
+CERT_SOURCE="$LEGO_PATH/certificates/_.${TUNNEL_BASE_DOMAIN}.crt"
+KEY_SOURCE="$LEGO_PATH/certificates/_.${TUNNEL_BASE_DOMAIN}.key"
+CERT_TARGET="/etc/nginx/ssl/${TUNNEL_BASE_DOMAIN}.crt"
+KEY_TARGET="/etc/nginx/ssl/${TUNNEL_BASE_DOMAIN}.key"
+
+install -d -o root -g root -m 755 /etc/nginx/ssl
+
+if [ -f "$CERT_SOURCE" ]; then
+  /usr/bin/lego --dns cloudflare --accept-tos \
+    --dns.resolvers 1.1.1.1:53 \
+    --domains "*.${TUNNEL_BASE_DOMAIN}" \
+    --email "$TUNNEL_ACME_EMAIL" \
+    --path "$LEGO_PATH" renew --days 30
+else
+  /usr/bin/lego --dns cloudflare --accept-tos \
+    --dns.resolvers 1.1.1.1:53 \
+    --domains "*.${TUNNEL_BASE_DOMAIN}" \
+    --email "$TUNNEL_ACME_EMAIL" \
+    --path "$LEGO_PATH" run
+fi
+
+install -o root -g root -m 600 "$CERT_SOURCE" "$CERT_TARGET.tmp"
+install -o root -g root -m 600 "$KEY_SOURCE" "$KEY_TARGET.tmp"
+
+/usr/sbin/nginx -t
+mv "$CERT_TARGET.tmp" "$CERT_TARGET"
+mv "$KEY_TARGET.tmp" "$KEY_TARGET"
+/usr/bin/systemctl reload nginx
+

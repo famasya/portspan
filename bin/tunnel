@@ -1,0 +1,128 @@
+#!/bin/sh
+set -eu
+
+USER_HOME=${HOME:?HOME is required}
+CONFIG_FILE=${TUNNEL_CONFIG_FILE:-"$USER_HOME/.config/tunnel/config"}
+
+# The config file contains only non-secret routing metadata. The token always
+# lives in a separate root/user-readable file.
+if [ -r "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+FRPC_BIN=${TUNNEL_FRPC:-"$USER_HOME/.local/lib/tunnel/frpc"}
+TOKEN_FILE=${TUNNEL_TOKEN_FILE:-"$USER_HOME/.config/tunnel/token"}
+SERVER_ADDR=${TUNNEL_SERVER_ADDR:-}
+SERVER_PORT=${TUNNEL_SERVER_PORT:-7000}
+BASE_DOMAIN=${TUNNEL_BASE_DOMAIN:-}
+
+usage() {
+  echo "Usage: tunnel --port PORT --domain LABEL [--host HOST] [--host-header HOST]" >&2
+  echo "Example: tunnel --port 3000 --domain app" >&2
+}
+
+fail() {
+  echo "tunnel: $*" >&2
+  usage
+  exit 2
+}
+
+port=
+domain=
+local_host=localhost
+host_header=localhost
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port)
+      [ "$#" -ge 2 ] || fail "--port requires a value"
+      port=$2
+      shift 2
+      ;;
+    --domain)
+      [ "$#" -ge 2 ] || fail "--domain requires a value"
+      domain=$2
+      shift 2
+      ;;
+    --host)
+      [ "$#" -ge 2 ] || fail "--host requires a value"
+      local_host=$2
+      shift 2
+      ;;
+    --host-header)
+      [ "$#" -ge 2 ] || fail "--host-header requires a value"
+      host_header=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "unknown option: $1"
+      ;;
+  esac
+done
+
+[ -n "$SERVER_ADDR" ] || fail "TUNNEL_SERVER_ADDR is not configured in $CONFIG_FILE or the environment"
+[ -n "$BASE_DOMAIN" ] || fail "TUNNEL_BASE_DOMAIN is not configured in $CONFIG_FILE or the environment"
+[ -n "$port" ] || fail "--port is required"
+[ -n "$domain" ] || fail "--domain is required"
+
+case "$port" in
+  *[!0-9]*) fail "port must be numeric" ;;
+esac
+[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null || fail "port must be between 1 and 65535"
+
+case "$SERVER_PORT" in
+  *[!0-9]*) fail "TUNNEL_SERVER_PORT must be numeric" ;;
+esac
+[ "$SERVER_PORT" -ge 1 ] 2>/dev/null && [ "$SERVER_PORT" -le 65535 ] 2>/dev/null || fail "TUNNEL_SERVER_PORT must be between 1 and 65535"
+
+case "$domain" in
+  ''|*[!a-z0-9-]*|-*|*-|control) fail "domain must be one lowercase DNS label and not reserved" ;;
+esac
+
+case "$local_host" in
+  ''|*[!A-Za-z0-9._:-]*) fail "host must contain only letters, numbers, dots, colons, or hyphens" ;;
+esac
+
+case "$host_header" in
+  ''|*[!A-Za-z0-9._:-]*) fail "host-header must contain only letters, numbers, dots, colons, hyphens, or underscores" ;;
+esac
+
+[ -x "$FRPC_BIN" ] || fail "frpc not found at $FRPC_BIN"
+[ -r "$TOKEN_FILE" ] || fail "token file not readable at $TOKEN_FILE"
+
+umask 077
+CONFIG_TMP=$(mktemp "${TMPDIR:-/tmp}/tunnel-frpc.XXXXXX")
+cleanup() {
+  rm -f "$CONFIG_TMP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+{
+  printf 'serverAddr = "%s"\n' "$SERVER_ADDR"
+  printf 'serverPort = %s\n' "$SERVER_PORT"
+  printf 'user = "portspan"\n'
+  printf 'auth.method = "token"\n'
+  printf 'auth.additionalScopes = ["HeartBeats", "NewWorkConns"]\n'
+  printf 'auth.tokenSource.type = "file"\n'
+  printf 'auth.tokenSource.file.path = "%s"\n' "$TOKEN_FILE"
+  printf 'transport.tls.enable = true\n'
+  printf '\n'
+  printf '[[proxies]]\n'
+  printf 'name = "web-%s-%s"\n' "$domain" "$port"
+  printf 'type = "http"\n'
+  printf 'localIP = "%s"\n' "$local_host"
+  printf 'localPort = %s\n' "$port"
+  printf 'subdomain = "%s"\n' "$domain"
+  printf 'hostHeaderRewrite = "%s"\n' "$host_header"
+} > "$CONFIG_TMP"
+
+"$FRPC_BIN" verify -c "$CONFIG_TMP"
+echo "Forwarding $local_host:$port to https://$domain.$BASE_DOMAIN"
+"$FRPC_BIN" -c "$CONFIG_TMP"

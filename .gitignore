@@ -1,0 +1,23 @@
+# Runtime secrets and local state
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.token
+token
+config/client.env
+deploy/tunnel.env
+
+# Downloaded release archives and extracted binaries
+*.tar.gz
+*.zip
+dist/
+
+# macOS/editor/temporary files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+

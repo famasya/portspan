@@ -1,0 +1,25 @@
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+# Keep proxy traffic private; Nginx is the only public HTTP entrypoint.
+proxyBindAddr = "127.0.0.1"
+vhostHTTPPort = 18080
+subDomainHost = "tunnel.example.com"
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/server-token"
+auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
+
+# Require encrypted frpc control connections.
+transport.tls.force = true
+
+# Do not disclose detailed backend/server errors to public clients.
+detailedErrorsToClient = false
+maxPortsPerClient = 20
+
+log.to = "console"
+log.level = "info"
+log.maxDays = 7
+log.disablePrintColor = true
+

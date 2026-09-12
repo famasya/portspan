@@ -4,6 +4,26 @@ Portspan is a self-hosted HTTP developer-tunnel stack. It uses frp for
 authenticated transport, wildcard DNS for labels, and Nginx for public HTTP
 or HTTPS termination.
 
+## CPU architecture portability
+
+- Treat CPU architecture as a first-class compatibility requirement. Portspan
+  must work on every CPU architecture supported by the target OS, runtime, and
+  upstream dependencies, including x86 (`i386`/`386`), `x86_64`/`amd64`, and
+  `aarch64`/`arm64`; do not make amd64 the only supported target.
+- Normalize OS and architecture aliases such as `i386`/`386`,
+  `x86_64`/`amd64`, `arm`/`armv7`, and `aarch64`/`arm64` before selecting
+  binaries, packages, paths, or build flags.
+- Keep separate, reviewed checksums for each downloaded architecture-specific
+  artifact. Select the matching verified upstream artifact for the host; when
+  no prebuilt artifact exists, use a reproducible portable build fallback.
+  Never make a non-amd64 host an unsupported target merely because the current
+  installer path has not been extended yet, and never install a binary for a
+  different CPU.
+- Update installers, tests, documentation, and release assets together when
+  adding architecture support. Verify each target natively where possible and
+  fix architecture-specific rejection paths before reporting the work
+  complete.
+
 ## Non-negotiable rules
 
 - Never commit tunnel tokens, Cloudflare tokens, private keys, certificates,
@@ -57,4 +77,3 @@ curl -v --max-time 15 http://app.${TUNNEL_BASE_DOMAIN}/
 ssh user@server 'systemctl is-active frps nginx'
 ssh user@server 'curl -H "Host: app.example" http://127.0.0.1:18080/'
 ```
-
